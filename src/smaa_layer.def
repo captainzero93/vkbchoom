@@ -1,0 +1,28 @@
+; smaa_layer.def -- explicit export table for the Vulkan loader.
+;
+; The old build relied on two different mechanisms at once and neither was
+; verified:
+;
+;   * __declspec(dllexport) for vkbChoom_GetInstanceProcAddr /
+;     vkbChoom_GetDeviceProcAddr  (works on MSVC and MinGW)
+;   * #pragma comment(linker, "/export:vkNegotiateLoaderLayerInterfaceVersion")
+;     for the negotiate entry point  (MSVC only -- MinGW GCC ignores
+;     #pragma comment(linker) with at most a warning, and the meson build
+;     sets gnu_symbol_visibility:'hidden', so under a GCC toolchain that
+;     symbol would simply not be in the export table)
+;
+; A .def covers both toolchains and, more importantly, makes the export set
+; something you can assert on rather than assume. After building, verify:
+;
+;     dumpbin /exports smaa_layer.dll
+; or  llvm-nm --extern-only --defined-only smaa_layer.dll
+;
+; All three names below must appear. If vkNegotiateLoaderLayerInterfaceVersion
+; is missing, a loader that requires interface v2 negotiation will skip the
+; layer with no error of any kind -- which is exactly the failure signature
+; being chased.
+
+EXPORTS
+    vkNegotiateLoaderLayerInterfaceVersion
+    vkbChoom_GetInstanceProcAddr
+    vkbChoom_GetDeviceProcAddr
