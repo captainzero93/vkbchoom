@@ -3,8 +3,9 @@
 // The whole install-and-diagnose tool, as one exe. Copy it into the game
 // folder next to smaa_layer.dll and vkbchoom.json, and double-click it.
 //
-//   install_vkbchoom.exe              register, verify, then check everything
-//   install_vkbchoom.exe -uninstall   remove the registration
+//   install_vkbchoom.exe              TOGGLE: install if off, uninstall if on
+//   install_vkbchoom.exe -install     install only, never toggles off
+//   install_vkbchoom.exe -uninstall   remove the registration, incl. stale ones
 //   install_vkbchoom.exe -status      report registration state only
 //   install_vkbchoom.exe -check       run all checks, change nothing
 //   install_vkbchoom.exe -debug on    turn diagnostic logging on  (restart Steam)
@@ -16,11 +17,13 @@
 //
 // CHANGES FROM THE OLD VERSION
 //
-// 1. It no longer TOGGLES. The old build registered if unregistered and
-//    unregistered if registered, so running it a second time to make sure it
-//    took would silently turn the layer back off. Mid-debugging-session that
-//    is a trap, not a convenience. Registering is now idempotent, with an
-//    explicit -uninstall.
+// 1. It TOGGLES again, deliberately. A double-click installs; a second
+//    double-click uninstalls and clears the registry entry, and says loudly
+//    which of the two just happened. The registration is a global Vulkan
+//    implicit layer, so the cheapest possible "get this off my machine" is
+//    worth more than the convenience of an idempotent install. The old
+//    idempotent behaviour is still there as -install, which never toggles
+//    off, for when you are debugging and need certainty.
 //
 // 2. It verifies the write by reading the value back, instead of assuming
 //    that RegSetValueEx returning ERROR_SUCCESS means the loader will see it.
@@ -517,6 +520,7 @@ static void checkRegistrations(const std::string& jsonPath)
         for (const RegValue& v : values)
         {
             bool        isOurs  = (v.name == jsonPath);
+            bool        isStale = !isOurs && v.name.find("vkbchoom") != std::string::npos;
             bool        present = fileExists(v.name);
             bool        enabled = (v.type == REG_DWORD && v.dword == 0);
             std::string label   = std::string(hive.name) + "  " + v.name;
@@ -524,19 +528,36 @@ static void checkRegistrations(const std::string& jsonPath)
             if (isOurs)
                 sawOurs = true;
 
-            if (!present)
-                bad(label + "   -> manifest file MISSING");
-            else if (!enabled)
-                bad(label + "   -> DISABLED (the value must be 0)");
-            else if (isOurs)
-                ok(label + "   -> enabled  (this one)");
-            else
-                ok(label + "   -> enabled");
+            // Only ever pass judgement on registrations that belong to us.
+            //
+            // The old code flagged ANY disabled or missing implicit layer as
+            // a [ !! ] problem, which meant a user who had temporarily
+            // switched off ReShade got told vkbchoom had found a fault, in
+            // vkbchoom's colours, in vkbchoom's summary count. Other
+            // people's layers are their business: we report what is there so
+            // the picture is complete, and we neither judge nor touch them.
+            if (isOurs || isStale)
+            {
+                if (!present)
+                    bad(label + "   -> manifest file MISSING");
+                else if (!enabled)
+                    bad(label + "   -> DISABLED (the value must be 0)");
+                else if (isOurs)
+                    ok(label + "   -> enabled  (this one)");
+                else
+                    warn(label + "   -> enabled");
 
-            // A leftover registration pointing at an older copy of this layer
-            // will load alongside, or instead of, the current one.
-            if (!isOurs && v.name.find("vkbchoom") != std::string::npos)
-                warn("     ^ another vkbchoom manifest, not the one next to this exe");
+                if (isStale)
+                {
+                    warn("     ^ another vkbchoom manifest, not the one next to this exe");
+                    note("       Run  install_vkbchoom.exe -uninstall  to clear stale entries.");
+                }
+            }
+            else
+            {
+                note(label + (present ? (enabled ? "   -> enabled" : "   -> disabled by its owner") : "   -> manifest missing"));
+                note("       (not ours -- listed for completeness, left untouched)");
+            }
         }
     }
 
@@ -983,27 +1004,121 @@ static void reportState(const std::string& jsonPath)
     note("manifest: " + jsonPath);
 }
 
+// Removes our registration AND any other vkbchoom implicit-layer entry left
+// in HKCU by a previous install from a different folder.
+//
+// The reason the second half matters: the registration is a registry value
+// keyed by the ABSOLUTE path of vkbchoom.json. Move the game, reinstall it to
+// a different drive, or just delete the mod folder, and the value stays
+// behind pointing at a manifest that no longer exists. The Vulkan loader then
+// has a dangling implicit layer to chew on for the rest of time, and nothing
+// the user can uninstall from the game folder will ever clear it. "Delete the
+// files" has to be a complete uninstall, so the uninstaller sweeps for our
+// leftovers by name.
+//
+// Returns the number of values removed.
+static int purgeOurRegistrations(const std::string& jsonPath, bool& sawHklm)
+{
+    int removed = 0;
+    sawHklm     = false;
+
+    // HKLM is read-only to us without elevation, and we should not be writing
+    // there anyway -- but if a vkbchoom entry exists there, say so, because
+    // it will keep loading the layer no matter what we do in HKCU.
+    for (const RegValue& v : enumerateValues(HKEY_LOCAL_MACHINE, IMPLICIT_LAYERS))
+    {
+        if (v.name.find("vkbchoom") != std::string::npos)
+        {
+            sawHklm = true;
+            bad("HKLM  " + v.name);
+            note("  A machine-wide vkbchoom registration exists. This tool only writes");
+            note("  to HKCU and will not touch it. Remove it with regedit (as admin) from");
+            note("  HKLM\\" + std::string(IMPLICIT_LAYERS));
+        }
+    }
+
+    HKEY key;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, IMPLICIT_LAYERS, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &key) != ERROR_SUCCESS)
+    {
+        note("no HKCU ImplicitLayers key exists -- nothing was registered");
+        return 0;
+    }
+
+    std::vector<std::string> toDelete;
+    for (const RegValue& v : enumerateValues(HKEY_CURRENT_USER, IMPLICIT_LAYERS))
+    {
+        if (v.name == jsonPath || v.name.find("vkbchoom") != std::string::npos)
+            toDelete.push_back(v.name);
+    }
+
+    for (const std::string& name : toDelete)
+    {
+        if (RegDeleteValueA(key, name.c_str()) == ERROR_SUCCESS)
+        {
+            ++removed;
+            ok("removed  HKCU  " + name + (name == jsonPath ? "   (this one)" : "   (stale)"));
+        }
+        else
+        {
+            bad("could not remove  HKCU  " + name);
+        }
+    }
+
+    RegCloseKey(key);
+    return removed;
+}
+
 static int doUnregister(const std::string& jsonPath)
 {
     head("Unregistering");
 
-    HKEY key;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, IMPLICIT_LAYERS, 0, KEY_SET_VALUE, &key) != ERROR_SUCCESS)
-    {
-        warn("no ImplicitLayers key exists, nothing to remove");
-        return 0;
-    }
+    bool sawHklm = false;
+    int  removed = purgeOurRegistrations(jsonPath, sawHklm);
 
-    LSTATUS result = RegDeleteValueA(key, jsonPath.c_str());
-    RegCloseKey(key);
-
-    if (result == ERROR_SUCCESS)
-        ok("unregistered -- SMAA is now off");
+    if (removed == 0)
+        note("nothing to remove -- vkbchoom was not registered for this user");
     else
-        warn("was not registered, nothing to remove");
+        ok(std::to_string(removed) + " registration" + (removed == 1 ? "" : "s") + " removed");
+
+    std::cout << "\n";
+    note("The Vulkan implicit-layer registration is now gone. smaa_layer.dll will");
+    note("no longer be loaded into ANY Vulkan application, including MGSV.");
+    note("Emulators and other Vulkan software are unaffected from here on.");
+    note("You can delete the mod files whenever you like -- the registry is clean.");
 
     reportState(jsonPath);
     return 0;
+}
+
+// Printed before we write anything. The implicit-layer registration is a
+// machine-wide-ish side effect and the user deserves to know that in plain
+// words rather than discovering it when an emulator stops launching.
+static void printRegistrationWarning()
+{
+    head("What registering actually does");
+    note("Vulkan has no way to register a layer for a single game. The only");
+    note("mechanism the loader offers is a GLOBAL implicit layer, so installing");
+    note("writes one value under:");
+    note("");
+    note("    HKCU\\" + std::string(IMPLICIT_LAYERS));
+    note("");
+    note("From then on the Vulkan loader will LOAD smaa_layer.dll into every");
+    note("Vulkan application you run -- emulators, other games, vulkaninfo, all");
+    note("of it. That is how implicit layers work and there is no way around it.");
+    note("");
+    note("What vkbchoom does about it: the layer checks the executable name at");
+    note("the earliest point the loader allows (interface negotiation) and, if it");
+    note("is not the target, declines to initialise. The loader then drops it out");
+    note("of the chain before an instance is ever created. Anything that is not");
+    note("MGSV sees no layer, no log file, and no behaviour change.");
+    note("");
+    note("Target executable comes from  targetExecutable  in vkbchoom.conf");
+    note("(default: mgsvtpp.exe).");
+    note("");
+    note("If anything Vulkan-related ever misbehaves, run:");
+    note("    install_vkbchoom.exe -uninstall");
+    note("which removes the registry entry completely. Deleting the mod files on");
+    note("their own does NOT remove it.");
 }
 
 static int doRegister(const std::string& jsonPath, const std::string& dllPath)
@@ -1068,6 +1183,7 @@ static int doRegister(const std::string& jsonPath, const std::string& dllPath)
     }
 
     ok("registered, and verified by reading it back");
+    printRegistrationWarning();
     return 0;
 }
 
@@ -1109,11 +1225,17 @@ static void printSummary()
 static void printUsage()
 {
     std::cout << "\n";
-    std::cout << "  install_vkbchoom.exe                register, verify, and check everything\n";
-    std::cout << "  install_vkbchoom.exe -uninstall     remove the registration\n";
+    std::cout << "  install_vkbchoom.exe                TOGGLE: installs if off, uninstalls if on\n";
+    std::cout << "  install_vkbchoom.exe -install       install only -- never toggles off\n";
+    std::cout << "  install_vkbchoom.exe -uninstall     remove the registration (and stale ones)\n";
     std::cout << "  install_vkbchoom.exe -status        report registration state only\n";
     std::cout << "  install_vkbchoom.exe -check         run all checks, change nothing\n";
     std::cout << "  install_vkbchoom.exe -debug on|off  diagnostic logging (restart Steam after)\n";
+    std::cout << "\n";
+    std::cout << "  Installing registers a GLOBAL Vulkan implicit layer under HKCU. The layer\n";
+    std::cout << "  declines to initialise outside mgsvtpp.exe, but the registration itself is\n";
+    std::cout << "  machine-wide -- -uninstall is the only thing that removes it. Deleting the\n";
+    std::cout << "  mod files does not.\n";
     std::cout << "\n";
 }
 
@@ -1167,9 +1289,35 @@ static int run(int argc, char** argv)
         return g_problems == 0 ? 0 : 1;
     }
 
-    if (arg == "uninstall")
+    if (arg == "uninstall" || arg == "remove" || arg == "disable")
     {
         doUnregister(jsonPath);
+        return 0;
+    }
+
+    // -install is the non-toggling path: register if not registered, say so
+    // and change nothing if it already is. Use this when you are mid-debug
+    // and need "make sure it is on" to mean exactly that.
+    if (arg == "install" || arg == "register" || arg == "enable")
+    {
+        if (queryLayerState(jsonPath) == 0)
+        {
+            head("Already installed");
+            ok("vkbchoom is registered and enabled -- nothing to do");
+            note("(-install never toggles. Use -uninstall to turn it off.)");
+            runAllChecks(exeDir, jsonPath, dllPath);
+            printSummary();
+            return 0;
+        }
+
+        int result = doRegister(jsonPath, dllPath);
+        if (result != 0)
+        {
+            printSummary();
+            return result;
+        }
+        runAllChecks(exeDir, jsonPath, dllPath);
+        printSummary();
         return 0;
     }
 
@@ -1180,13 +1328,53 @@ static int run(int argc, char** argv)
         return 1;
     }
 
-    // Default, and the only thing most people need: register, then check.
+    // ---------------------------------------------------------------
+    // Default (double-click) behaviour: TOGGLE.
+    //
+    // An earlier version of this tool toggled, it was changed to always-
+    // register, and it is now back to toggling on request -- so, for the
+    // record, the trade-off both ways:
+    //
+    //   Toggling is right for users. One file, double-click to turn the mod
+    //   on, double-click to turn it off. Given that leaving the registration
+    //   behind is the thing that breaks unrelated Vulkan software, the
+    //   easiest possible "off" is worth a lot, and most people will never
+    //   type an argument at a command line.
+    //
+    //   Toggling is a trap when debugging. Running it twice to "make sure it
+    //   took" silently turns the layer back off, and you then spend an hour
+    //   wondering why the log is empty.
+    //
+    // So: toggle by default, but be loud about which direction it went, and
+    // keep -install as the idempotent path for when you need certainty.
+    // ---------------------------------------------------------------
+    if (queryLayerState(jsonPath) == 0)
+    {
+        head("Already installed -- turning it OFF");
+        std::cout << "\n";
+        colour(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+        std::cout << "  vkbchoom was already registered, so this run has DISABLED it.\n";
+        resetColour();
+        note("This exe is a toggle: run it once to install, again to uninstall.");
+        note("Run it a third time to turn the mod back on.");
+        note("If you meant to verify the install without changing anything, use:");
+        note("    install_vkbchoom.exe -status     (report only)");
+        note("    install_vkbchoom.exe -check      (full checks, changes nothing)");
+        note("    install_vkbchoom.exe -install    (install, never toggles off)");
+
+        doUnregister(jsonPath);
+        return 0;
+    }
+
     int result = doRegister(jsonPath, dllPath);
     if (result != 0)
     {
         printSummary();
         return result;
     }
+
+    std::cout << "\n";
+    note("This exe is a toggle: run it again to uninstall and clear the registry.");
 
     runAllChecks(exeDir, jsonPath, dllPath);
     printSummary();

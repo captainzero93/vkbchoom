@@ -6,7 +6,7 @@
     "library_path": ".\\smaa_layer.dll",
     "api_version": "1.3.223",
     "implementation_version": "1",
-    "description": "Minimal SMAA post-processing layer for DXVK, stripped down from vkBasalt",
+    "description": "Minimal SMAA post-processing layer for MGSV via DXVK, stripped down from vkBasalt. Registered globally because Vulkan has no per-application layer registration, but declines initialisation in any process other than its configured target (targetExecutable in vkbchoom.conf, default mgsvtpp.exe), so it is inert in all other Vulkan applications.",
     "functions": {
       "vkGetInstanceProcAddr": "vkbChoom_GetInstanceProcAddr",
       "vkGetDeviceProcAddr":   "vkbChoom_GetDeviceProcAddr"

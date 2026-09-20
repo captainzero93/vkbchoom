@@ -166,8 +166,180 @@ namespace vkbChoom
         return base;
     }
 
+    // -----------------------------------------------------------------
+    // The process gate. See the long comment in platform_win32.hpp.
+    // -----------------------------------------------------------------
+
+    namespace
+    {
+        bool equalsNoCaseA(const std::string& a, const std::string& b)
+        {
+            if (a.size() != b.size())
+                return false;
+            for (size_t i = 0; i < a.size(); i++)
+            {
+                unsigned char ca = static_cast<unsigned char>(a[i]);
+                unsigned char cb = static_cast<unsigned char>(b[i]);
+                if (ca >= 'A' && ca <= 'Z')
+                    ca = static_cast<unsigned char>(ca - 'A' + 'a');
+                if (cb >= 'A' && cb <= 'Z')
+                    cb = static_cast<unsigned char>(cb - 'A' + 'a');
+                if (ca != cb)
+                    return false;
+            }
+            return true;
+        }
+
+        std::string trimA(const std::string& s)
+        {
+            size_t b = s.find_first_not_of(" \t\r\n\"");
+            if (b == std::string::npos)
+                return std::string();
+            size_t e = s.find_last_not_of(" \t\r\n\"");
+            return s.substr(b, e - b + 1);
+        }
+
+        // Raw-Win32 read of a small text file. No ifstream: this runs before
+        // (and independently of) any CRT/iostream state we can rely on, and
+        // may be called from DllMain.
+        std::string slurpSmallFileA(const std::string& path)
+        {
+            HANDLE h = CreateFileA(path.c_str(),
+                                   GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                   nullptr,
+                                   OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL,
+                                   nullptr);
+            if (h == INVALID_HANDLE_VALUE)
+                return std::string();
+
+            LARGE_INTEGER size{};
+            if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0 || size.QuadPart > (1 << 20))
+            {
+                CloseHandle(h);
+                return std::string();
+            }
+
+            std::string buf(static_cast<size_t>(size.QuadPart), '\0');
+            DWORD       read = 0;
+            BOOL        good = ReadFile(h, &buf[0], static_cast<DWORD>(buf.size()), &read, nullptr);
+            CloseHandle(h);
+
+            if (!good)
+                return std::string();
+            buf.resize(read);
+            return buf;
+        }
+
+        // Pulls "targetExecutable = foo.exe" out of a conf file's text.
+        // Comment-aware in the same way Config::readConfigLine is: '#' ends
+        // the line. Returns "" if the key is absent.
+        std::string targetFromConfText(const std::string& text)
+        {
+            size_t pos = 0;
+            while (pos < text.size())
+            {
+                size_t      eol  = text.find_first_of("\r\n", pos);
+                std::string line = text.substr(pos, (eol == std::string::npos ? text.size() : eol) - pos);
+                pos              = (eol == std::string::npos) ? text.size() : eol + 1;
+
+                size_t hash = line.find('#');
+                if (hash != std::string::npos)
+                    line = line.substr(0, hash);
+
+                size_t eq = line.find('=');
+                if (eq == std::string::npos)
+                    continue;
+
+                if (!equalsNoCaseA(trimA(line.substr(0, eq)), "targetExecutable"))
+                    continue;
+
+                std::string value = trimA(line.substr(eq + 1));
+                if (!value.empty())
+                    return value;
+            }
+            return std::string();
+        }
+
+        // -1 = not yet decided, 0 = inert here, 1 = this is the target.
+        // Plain int with a constant initialiser on purpose: a function-local
+        // static with a non-constant initialiser compiles to a guarded,
+        // thread-safe init, and taking that guard under the loader lock in
+        // DllMain is a deadlock risk. Worst case here is that two threads
+        // both compute the same deterministic answer and write the same
+        // value, which is harmless.
+        int g_gateState  = -1;
+        int g_forceLog   = -1;
+    } // namespace
+
+    std::string targetExecutableName()
+    {
+        std::string fromEnv = envVarA("VKBCHOOM_TARGET_EXE");
+        if (!fromEnv.empty())
+            return fromEnv;
+
+        if (std::string dir = moduleDir(); !dir.empty())
+        {
+            std::string t = targetFromConfText(slurpSmallFileA(dir + "vkbchoom.conf"));
+            if (!t.empty())
+                return t;
+        }
+
+        if (std::string dir = exeDir(); !dir.empty())
+        {
+            std::string t = targetFromConfText(slurpSmallFileA(dir + "vkbchoom.conf"));
+            if (!t.empty())
+                return t;
+        }
+
+        return std::string("mgsvtpp.exe");
+    }
+
+    bool layerShouldRunHere()
+    {
+        if (g_gateState >= 0)
+            return g_gateState == 1;
+
+        const std::string self    = exeName();
+        const std::string targets = targetExecutableName();
+
+        bool   match = false;
+        size_t pos   = 0;
+        while (pos <= targets.size())
+        {
+            size_t      sep  = targets.find(';', pos);
+            std::string one  = trimA(targets.substr(pos, (sep == std::string::npos ? targets.size() : sep) - pos));
+            if (!one.empty() && equalsNoCaseA(self, one))
+            {
+                match = true;
+                break;
+            }
+            if (sep == std::string::npos)
+                break;
+            pos = sep + 1;
+        }
+
+        g_gateState = match ? 1 : 0;
+        return match;
+    }
+
     void breadcrumb(const std::string& message)
     {
+        // THE GATE, applied to our noisiest side effect. Without this the
+        // layer creates %LOCALAPPDATA%\vkbchoom\vkbchoom_load.log and spams
+        // OutputDebugString inside every Vulkan process on the machine --
+        // which is how vkbchoom's own diagnostics ended up reporting
+        // citron.exe and pcsx2-qt.exe as "loaded". A layer that is supposed
+        // to be inert outside MGSV must not leave traces outside MGSV.
+        if (!layerShouldRunHere())
+        {
+            if (g_forceLog < 0)
+                g_forceLog = (envVarA("VKBCHOOM_FORCE_LOG") == "1") ? 1 : 0;
+            if (g_forceLog != 1)
+                return;
+        }
+
         // Always mirror to the debugger channel. This is the one output that
         // cannot fail for filesystem reasons -- Sysinternals DebugView (run
         // as admin, "Capture Global Win32" enabled) will show it even if
@@ -205,7 +377,13 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
             // Deliberately the smallest possible amount of work. Anything
             // heavier here risks a loader-lock deadlock; all real init still
             // happens lazily in vkbChoom_GetInstanceProcAddr.
-            vkbChoom::breadcrumb("DLL_PROCESS_ATTACH  dll=" + vkbChoom::modulePath()
+            // breadcrumb() self-gates: in a non-target process this whole
+            // call is a no-op, so attaching to someone else's emulator
+            // leaves no file, no log line and no debugger output.
+            vkbChoom::breadcrumb(std::string("DLL_PROCESS_ATTACH  gate=")
+                                 + (vkbChoom::layerShouldRunHere() ? "ACTIVE" : "inert")
+                                 + "  target=" + vkbChoom::targetExecutableName()
+                                 + "  dll=" + vkbChoom::modulePath()
                                  + "  exedir=" + vkbChoom::exeDir()
                                  + "  cwd=" + vkbChoom::currentDir());
             break;

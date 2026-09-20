@@ -46,8 +46,23 @@ namespace vkbChoom
     // least one channel that works.
     // ------------------------------------------------------------------
 
-    Logger::Logger() : m_minLevel(getMinLogLevel())
+    // s_instance is a namespace-scope static, so this constructor runs during
+    // static init in EVERY process the Vulkan loader loads smaa_layer.dll
+    // into -- which, for a global implicit layer, is every process on the
+    // machine that touches Vulkan. Opening a log file there is a side effect
+    // inside somebody else's application, and it is how vkbchoom's own
+    // diagnostics ended up reporting unrelated executables as "loaded".
+    // Outside the target process we do not log at all: no file, no stream,
+    // no breadcrumb. m_minLevel is const, so the gate goes in the member
+    // initialiser rather than the body.
+    Logger::Logger() : m_minLevel(layerShouldRunHere() ? getMinLogLevel() : LogLevel::None)
     {
+        if (!layerShouldRunHere())
+        {
+            m_outStream.reset();
+            return;
+        }
+
         // Proof of life that does not depend on anything below succeeding.
         breadcrumb("Logger ctor reached (static init ran, CRT is alive)");
 

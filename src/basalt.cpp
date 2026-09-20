@@ -74,34 +74,44 @@ namespace vkbChoom
     using scoped_lock = std::lock_guard<std::mutex>;
 #endif
 
-    namespace
-    {
-        bool equalsIgnoreCaseAscii(const std::string& a, const std::string& b)
-        {
-            if (a.size() != b.size())
-                return false;
-            for (size_t i = 0; i < a.size(); i++)
-            {
-                if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i])))
-                    return false;
-            }
-            return true;
-        }
-    } // namespace
+    // ------------------------------------------------------------------
+    // Passthrough state, used ONLY in non-target processes.
+    //
+    // See the long comment on the passthrough_* functions below for why
+    // these exist. They are deliberately separate from instanceDispatchMap /
+    // deviceMap so that nothing in the effect, swapchain or screenshot code
+    // can ever observe a non-target process.
+    // ------------------------------------------------------------------
+    std::mutex                                          passthroughLock;
+    std::unordered_map<void*, PFN_vkGetInstanceProcAddr> passthroughInstanceGipa;
+    std::unordered_map<void*, PFN_vkGetDeviceProcAddr>   passthroughDeviceGdpa;
 
     // Whether this process is the one the layer should actually do anything
     // in. vkbchoom.json registers as a Vulkan GLOBAL implicit layer -- the
     // loader has no "only for this one game" concept, so any process that
     // creates a Vulkan instance gets smaa_layer.dll loaded and asked to
-    // participate, which is how this ended up quietly running inside
-    // chaiNNer's bundled python.exe too. Every real interception in this
-    // file funnels through INTERCEPT_CALLS, which checks this first; outside
-    // the target process it's a silent passthrough. See "Scope" in the
-    // README and the matching note under "Notes for maintainers".
+    // participate.
+    //
+    // This used to be:
+    //
+    //     static const bool result = equalsIgnoreCaseAscii(
+    //         exeName(), pConfig->getOption<std::string>("targetExecutable", ...));
+    //
+    // which had two problems. It dereferenced pConfig, which is null until
+    // somebody has been through GetInstanceProcAddr -- so calling it any
+    // earlier (from vkNegotiateLoaderLayerInterfaceVersion, say, which is
+    // the first thing a modern loader calls) is a null deref. And it forced
+    // a config-file read and a Logger construction inside every Vulkan
+    // process on the machine just to decide that we did not want to be
+    // there.
+    //
+    // The decision now lives in layerShouldRunHere() (platform_win32.cpp):
+    // executable name only, kernel32 only, cached, safe from DllMain and
+    // from negotiation. pConfig's targetExecutable is still honoured -- the
+    // gate scans vkbchoom.conf for it directly.
     bool isTargetProcess()
     {
-        static const bool result = equalsIgnoreCaseAscii(exeName(), pConfig->getOption<std::string>("targetExecutable", "mgsvtpp.exe"));
-        return result;
+        return layerShouldRunHere();
     }
 
     template<typename DispatchableType>
@@ -1233,6 +1243,136 @@ namespace vkbChoom
         }
         return VK_SUCCESS;
     }
+    // ==================================================================
+    // PASSTHROUGH PATH -- non-target processes
+    // ==================================================================
+    //
+    // THIS IS THE FIX FOR THE "vkbchoom breaks every other Vulkan app" BUG.
+    //
+    // What was wrong: isTargetProcess() gated INTERCEPT_CALLS, and the
+    // comment above it claimed that outside the target process the layer was
+    // "a silent passthrough". It was not. Registering as an implicit layer
+    // puts us in the chain of every Vulkan process whether we want to be
+    // there or not, and the loader then drives us through
+    // vkbChoom_GetInstanceProcAddr / vkbChoom_GetDeviceProcAddr like any
+    // other layer. With INTERCEPT_CALLS skipped, both of those fell straight
+    // through to the bottom block, which
+    //
+    //   * returns nullptr when the handle is VK_NULL_HANDLE, and
+    //   * returns nullptr when the handle is not in our dispatch map
+    //
+    // and in a non-target process the dispatch maps are never populated,
+    // because the thing that populates them is vkbChoom_CreateInstance,
+    // which INTERCEPT_CALLS just declined to hand out. So the maps stay
+    // empty forever and EVERY function query, for every function, in every
+    // unrelated Vulkan application, returned NULL.
+    //
+    // That is not a passthrough. That is a black hole sitting in the middle
+    // of the chain. Downstream, whoever dereferences the first NULL function
+    // pointer they were handed takes the access violation -- which is the
+    // 0xC0000005 in vulkaninfo, and the emulators failing to start.
+    //
+    // The fix has two layers, belt and braces:
+    //
+    //   1. PRIMARY: decline at negotiation. See
+    //      vkNegotiateLoaderLayerInterfaceVersion below -- if we are not in
+    //      the target process we return VK_ERROR_INITIALIZATION_FAILED and
+    //      the loader drops us out of the chain entirely, before any
+    //      instance exists. Nothing below this comment ever runs. That is
+    //      the behaviour we actually want: registered globally, but present
+    //      in exactly one process.
+    //
+    //   2. SECONDARY (this code): if a loader ever reaches our
+    //      get*ProcAddr without negotiating -- older loaders fall back to
+    //      the manifest's "functions" block and call the named exports
+    //      directly -- we must still behave like a correct, inert layer
+    //      rather than a null factory. So we keep the absolute minimum
+    //      needed to stay honest in the chain: intercept vkCreateInstance
+    //      and vkCreateDevice purely to advance the chain link and record
+    //      the next layer's proc-addr functions, then forward everything.
+    //      No dispatch tables, no swapchain hooks, no config, no logging.
+    //
+    // Keep both. (1) is what stops us touching anything; (2) is what makes
+    // the failure mode of (1) a no-op rather than a crash.
+
+    VkResult VKAPI_CALL passthrough_CreateInstance(const VkInstanceCreateInfo*  pCreateInfo,
+                                                   const VkAllocationCallbacks* pAllocator,
+                                                   VkInstance*                  pInstance)
+    {
+        if (pCreateInfo == nullptr || pInstance == nullptr)
+            return VK_ERROR_INITIALIZATION_FAILED;
+
+        VkLayerInstanceCreateInfo* layerCreateInfo = (VkLayerInstanceCreateInfo*) pCreateInfo->pNext;
+        while (layerCreateInfo
+               && (layerCreateInfo->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO
+                   || layerCreateInfo->function != VK_LAYER_LINK_INFO))
+        {
+            layerCreateInfo = (VkLayerInstanceCreateInfo*) layerCreateInfo->pNext;
+        }
+
+        if (layerCreateInfo == nullptr || layerCreateInfo->u.pLayerInfo == nullptr)
+            return VK_ERROR_INITIALIZATION_FAILED;
+
+        PFN_vkGetInstanceProcAddr gpa = layerCreateInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+        layerCreateInfo->u.pLayerInfo = layerCreateInfo->u.pLayerInfo->pNext; // advance for the next layer
+
+        PFN_vkCreateInstance createFunc = (PFN_vkCreateInstance) gpa(VK_NULL_HANDLE, "vkCreateInstance");
+        if (createFunc == nullptr)
+            return VK_ERROR_INITIALIZATION_FAILED;
+
+        // pCreateInfo goes down UNMODIFIED. The target-process path bumps
+        // apiVersion to 1.1 and can add extensions; doing any of that in
+        // somebody else's application would be exactly the kind of
+        // interference this whole change exists to remove.
+        VkResult ret = createFunc(pCreateInfo, pAllocator, pInstance);
+        if (ret != VK_SUCCESS)
+            return ret;
+
+        {
+            scoped_lock l(passthroughLock);
+            passthroughInstanceGipa[GetKey(*pInstance)] = gpa;
+        }
+        return ret;
+    }
+
+    VkResult VKAPI_CALL passthrough_CreateDevice(VkPhysicalDevice             physicalDevice,
+                                                 const VkDeviceCreateInfo*    pCreateInfo,
+                                                 const VkAllocationCallbacks* pAllocator,
+                                                 VkDevice*                    pDevice)
+    {
+        if (pCreateInfo == nullptr || pDevice == nullptr)
+            return VK_ERROR_INITIALIZATION_FAILED;
+
+        VkLayerDeviceCreateInfo* layerCreateInfo = (VkLayerDeviceCreateInfo*) pCreateInfo->pNext;
+        while (layerCreateInfo
+               && (layerCreateInfo->sType != VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO
+                   || layerCreateInfo->function != VK_LAYER_LINK_INFO))
+        {
+            layerCreateInfo = (VkLayerDeviceCreateInfo*) layerCreateInfo->pNext;
+        }
+
+        if (layerCreateInfo == nullptr || layerCreateInfo->u.pLayerInfo == nullptr)
+            return VK_ERROR_INITIALIZATION_FAILED;
+
+        PFN_vkGetInstanceProcAddr gipa = layerCreateInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+        PFN_vkGetDeviceProcAddr   gdpa = layerCreateInfo->u.pLayerInfo->pfnNextGetDeviceProcAddr;
+        layerCreateInfo->u.pLayerInfo  = layerCreateInfo->u.pLayerInfo->pNext;
+
+        PFN_vkCreateDevice createFunc = (PFN_vkCreateDevice) gipa(VK_NULL_HANDLE, "vkCreateDevice");
+        if (createFunc == nullptr)
+            return VK_ERROR_INITIALIZATION_FAILED;
+
+        VkResult ret = createFunc(physicalDevice, pCreateInfo, pAllocator, pDevice);
+        if (ret != VK_SUCCESS)
+            return ret;
+
+        {
+            scoped_lock l(passthroughLock);
+            passthroughDeviceGdpa[GetKey(*pDevice)] = gdpa;
+        }
+        return ret;
+    }
+
 } // namespace vkbChoom
 
 extern "C"
@@ -1264,6 +1404,31 @@ extern "C"
     VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVersionStruct)
     {
         if (pVersionStruct == nullptr || pVersionStruct->sType != LAYER_NEGOTIATE_INTERFACE_STRUCT)
+            return VK_ERROR_INITIALIZATION_FAILED;
+
+        // ==============================================================
+        // THE EARLY-OUT. This is the single most important thing in the
+        // file for anyone who is not playing MGSV.
+        //
+        // vkbchoom.json is registered as a GLOBAL implicit layer under
+        // HKCU\Software\Khronos\Vulkan\ImplicitLayers, because that is the
+        // only registration Vulkan has -- the loader has no notion of "load
+        // this layer for one executable". Consequently smaa_layer.dll is
+        // loaded into every process on the machine that touches Vulkan.
+        //
+        // Negotiation is the earliest point at which we can get a word in.
+        // Returning an error here tells the loader we cannot participate,
+        // and it removes us from the chain instead of building an instance
+        // chain through us. No instance, no device, no dispatch tables, no
+        // swapchain hooks, no chance to return a NULL function pointer to
+        // somebody who is going to call it. From an emulator's point of
+        // view, the layer may as well not be registered at all.
+        //
+        // This happens before anything else in this DLL initialises, and
+        // layerShouldRunHere() is built to be safe to call this early --
+        // kernel32 only, no Config, no Logger, no heap to speak of.
+        // ==============================================================
+        if (!vkbChoom::layerShouldRunHere())
             return VK_ERROR_INITIALIZATION_FAILED;
 
         // We only need interface v1 behavior (get*ProcAddr by name); report
@@ -1334,13 +1499,35 @@ extern "C"
 
     VKBCHOOM_EXPORT PFN_vkVoidFunction VKAPI_CALL vkbChoom_GetDeviceProcAddr(VkDevice device, const char* pName)
     {
+        if (pName == nullptr)
+            return nullptr;
+
+        // Non-target process: forward, never black-hole. We only reach here
+        // at all if the loader skipped negotiation (see the early-out in
+        // vkNegotiateLoaderLayerInterfaceVersion). Note that we do NOT
+        // construct Config and do NOT log -- both of those are filesystem
+        // side effects inside an application that has nothing to do with us.
+        if (!vkbChoom::layerShouldRunHere())
+        {
+            if (!std::strcmp(pName, "vkGetDeviceProcAddr"))
+                return (PFN_vkVoidFunction) &vkbChoom_GetDeviceProcAddr;
+            if (!std::strcmp(pName, "vkCreateDevice"))
+                return (PFN_vkVoidFunction) &vkbChoom::passthrough_CreateDevice;
+
+            if (device == VK_NULL_HANDLE)
+                return nullptr;
+
+            vkbChoom::scoped_lock l(vkbChoom::passthroughLock);
+            auto                  it = vkbChoom::passthroughDeviceGdpa.find(vkbChoom::GetKey(device));
+            if (it == vkbChoom::passthroughDeviceGdpa.end() || it->second == nullptr)
+                return nullptr;
+            return it->second(device, pName);
+        }
+
         if (vkbChoom::pConfig == nullptr)
         {
             vkbChoom::pConfig = std::shared_ptr<vkbChoom::Config>(new vkbChoom::Config());
         }
-
-        if (pName == nullptr)
-            return nullptr;
 
         vkbChoom::Logger::trace(std::string("GetDeviceProcAddr queried: ") + pName);
 
@@ -1367,23 +1554,55 @@ extern "C"
 
     VKBCHOOM_EXPORT PFN_vkVoidFunction VKAPI_CALL vkbChoom_GetInstanceProcAddr(VkInstance instance, const char* pName)
     {
+        if (pName == nullptr)
+            return nullptr;
+
+        // Non-target process: forward, never black-hole. Reaching here means
+        // the loader did not negotiate (see the early-out in
+        // vkNegotiateLoaderLayerInterfaceVersion), so we have to be a
+        // correct no-op layer by hand.
+        //
+        // The two names below are the ones that MUST NOT come back NULL.
+        // vkCreateInstance is how the loader builds the chain through us;
+        // returning NULL for it is what turned this layer into a black hole
+        // in every unrelated Vulkan application. Everything else we simply
+        // forward to the next layer down once we have its proc-addr.
+        if (!vkbChoom::layerShouldRunHere())
+        {
+            if (!std::strcmp(pName, "vkGetInstanceProcAddr"))
+                return (PFN_vkVoidFunction) &vkbChoom_GetInstanceProcAddr;
+            if (!std::strcmp(pName, "vkCreateInstance"))
+                return (PFN_vkVoidFunction) &vkbChoom::passthrough_CreateInstance;
+            if (!std::strcmp(pName, "vkGetDeviceProcAddr"))
+                return (PFN_vkVoidFunction) &vkbChoom_GetDeviceProcAddr;
+            if (!std::strcmp(pName, "vkCreateDevice"))
+                return (PFN_vkVoidFunction) &vkbChoom::passthrough_CreateDevice;
+
+            if (instance == VK_NULL_HANDLE)
+                return nullptr; // no global entry points of our own, correctly
+
+            vkbChoom::scoped_lock l(vkbChoom::passthroughLock);
+            auto                  it = vkbChoom::passthroughInstanceGipa.find(vkbChoom::GetKey(instance));
+            if (it == vkbChoom::passthroughInstanceGipa.end() || it->second == nullptr)
+                return nullptr;
+            return it->second(instance, pName);
+        }
+
         // Proof that the loader reached our code, independent of whether the
-        // config or the log file resolved. Fires once per process.
+        // config or the log file resolved. Fires once per process, and only
+        // in the target process.
         static bool s_firstCall = true;
         if (s_firstCall)
         {
             s_firstCall = false;
             vkbChoom::breadcrumb(std::string("first vkbChoom_GetInstanceProcAddr -- loader is in our chain (pName=")
-                                 + (pName ? pName : "<null>") + ")");
+                                 + pName + ")");
         }
 
         if (vkbChoom::pConfig == nullptr)
         {
             vkbChoom::pConfig = std::shared_ptr<vkbChoom::Config>(new vkbChoom::Config());
         }
-
-        if (pName == nullptr)
-            return nullptr;
 
         vkbChoom::Logger::trace(std::string("GetInstanceProcAddr queried: ") + pName);
 

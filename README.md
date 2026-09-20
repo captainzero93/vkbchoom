@@ -11,6 +11,83 @@ black/white/red). No FXAA/LUT/deband, no ReShade FX support, no X11.
 
 ---
 
+# Fixed: earlier versions broke other Vulkan applications
+
+**If you installed a build before this one and your emulators, other Vulkan
+games or `vulkaninfo` stopped working, that was this mod, and this version
+fixes it.**
+
+Immediate fix if you're on an old build:
+
+```
+install_vkbchoom.exe -uninstall
+```
+
+That removes the Vulkan implicit-layer registration and everything works
+again. Deleting the mod files on their own does **not** do this — see
+[Uninstalling properly](#uninstalling-properly).
+
+### What went wrong
+
+Vulkan has no way to register a layer for a single application. A global
+implicit layer is the only mechanism the loader offers, so `smaa_layer.dll`
+gets loaded into every process on the machine that creates a Vulkan instance.
+That part is unavoidable and normal.
+
+The layer was supposed to notice it wasn't in MGSV and get out of the way. It
+didn't. The process check also disabled the code that hands out
+`vkCreateInstance`, which is the only thing that populates the layer's
+dispatch table — so outside MGSV the table was never populated, and every
+function the loader or the application asked for came back `NULL`. The layer
+stayed in the middle of the loader chain answering NULL to everything.
+Whatever dereferenced the first null function pointer took the access
+violation. That's the `0xC0000005` in `vulkaninfo` and the emulators failing
+to start.
+
+It also wrote its breadcrumb log and opened `smaa_layer.log` inside those
+unrelated processes, which is why vkbchoom's own diagnostics listed
+executables that had nothing to do with MGSV.
+
+### What changed
+
+- **The layer now declines at negotiation.**
+  `vkNegotiateLoaderLayerInterfaceVersion` is the first thing a modern loader
+  calls; outside the target executable it returns
+  `VK_ERROR_INITIALIZATION_FAILED` and the loader drops the layer from the
+  chain before an instance exists. Other applications see no layer at all.
+- **The fallback path is a real passthrough.** If a loader skips negotiation,
+  the proc-addr functions now forward to the next layer instead of returning
+  NULL, and pass the create-info down unmodified.
+- **No side effects outside the target.** No log file, no breadcrumb, no
+  `OutputDebugString`, no config read. `VKBCHOOM_FORCE_LOG=1` overrides this
+  if you're debugging the gate itself.
+- **`-uninstall` cleans up properly**, including stale registrations left by
+  earlier installs in other folders.
+- **The installer explains what registering does** before you live with it,
+  and no longer reports unrelated layers (ReShade, etc.) as vkbchoom problems.
+  It has never modified, and will never modify, a layer registration that
+  isn't its own.
+- **Running the installer with no arguments is now a toggle** — first run
+  installs, second run uninstalls. Use `-install` if you want it to only ever
+  install.
+
+Full technical detail in [Scope](#scope) and
+[Notes for maintainers](#notes-for-maintainers).
+
+### Verifying it on your own machine
+
+After installing, run `vulkaninfo` and anything else Vulkan-based, then check:
+
+```
+%LOCALAPPDATA%\vkbchoom\vkbchoom_load.log
+```
+
+That file should **not exist** unless you've launched MGSV. If it does, open
+it — any line whose executable column isn't `mgsvtpp.exe` means the process
+gate isn't working, and that's worth reporting as a bug.
+
+---
+
 # Building
 
 ## What you need
@@ -68,14 +145,36 @@ anything that would stop the layer loading.
 **No Steam launch options. No environment variables.** Launch the game normally.
 
 ```
-install_vkbchoom.exe                register, verify, and check everything
-install_vkbchoom.exe -uninstall     remove the registration
+install_vkbchoom.exe                TOGGLE: installs if off, uninstalls if on
+install_vkbchoom.exe -install       install only - never toggles off
+install_vkbchoom.exe -uninstall     remove the registration (and stale ones)
 install_vkbchoom.exe -status        report registration state only
 install_vkbchoom.exe -check         run all checks, change nothing
 install_vkbchoom.exe -debug on|off  diagnostic logging (restart Steam after)
 ```
 
-Registering is idempotent - running it twice is safe.
+Running it with no arguments is a **toggle**. Double-click once to install,
+again to uninstall - it says which of the two just happened. If you want to
+check the install without risking turning it off, use `-status` or `-check`;
+if you want "install and stay installed", use `-install`.
+
+### Uninstalling properly
+
+Installing writes a global Vulkan implicit-layer registration under
+`HKCU\Software\Khronos\Vulkan\ImplicitLayers`. **Deleting the mod files does
+not remove it** - the value is keyed by the absolute path of
+`vkbchoom.json`, so a deleted or moved install leaves the loader with a
+dangling implicit layer forever.
+
+Always uninstall with:
+
+```
+install_vkbchoom.exe -uninstall
+```
+
+which removes our registration and sweeps HKCU for any stale `vkbchoom`
+entries left by earlier installs in other folders. It reports, but will not
+touch, anything in HKLM or any layer that isn't ours.
 
 ### What `-check` looks for
 
@@ -105,24 +204,47 @@ Vulkan's implicit-layer registration has no concept of "only for this one
 game" - once `vkbchoom.json` is registered, any process on the machine that
 creates a Vulkan instance gets `smaa_layer.dll` loaded and asked to
 participate. That's not hypothetical: `vkbchoom_load.log` has shown this
-layer loading into chaiNNer's bundled `python.exe`, because chaiNNer's Vulkan
-backend does the same thing MGSV does - create an instance - and the loader
-doesn't discriminate.
+layer loading into chaiNNer's bundled `python.exe`, and into unrelated
+emulators.
 
-The layer checks the host process's own executable name before any real
-interception happens, and is a complete passthrough everywhere except a
-configured target: no fake swapchain, no SMAA, nothing - every function
-resolves straight to whatever's underneath it, the same as if the layer
-weren't installed. Default target is `mgsvtpp.exe`; override with
-`targetExecutable` in `vkbchoom.conf` (case-insensitive) to point this at a
-different game's executable instead.
+**This was previously handled badly, and it broke things.** The layer checked
+the executable name before intercepting anything, which the README described
+as "a complete passthrough everywhere except a configured target". It was
+not. Skipping the interception also skipped handing out `vkCreateInstance`,
+so the dispatch maps were never populated, so every subsequent function query
+fell through to a `return nullptr`. The layer stayed in the chain and
+answered NULL to everything asked of it. Unrelated Vulkan applications
+crashed downstream on the first null function pointer they dereferenced.
 
-One thing this doesn't (yet) avoid: `vkbchoom.conf` itself is still read in
-every process the layer loads into, since the check needs a config value
-before it can know whether to skip everything else. So `smaa_layer.log` may
-still appear with a config dump somewhere harmless like chaiNNer, even though
-nothing past that point runs. Cosmetic, not functional - flag it if it's
-worth tightening further.
+How it works now, in order:
+
+1. **Negotiation declines.** `vkNegotiateLoaderLayerInterfaceVersion` is the
+   first thing a modern loader calls. Outside the target process it returns
+   `VK_ERROR_INITIALIZATION_FAILED` and the loader drops the layer from the
+   chain before an instance exists. Nothing else in the DLL runs.
+2. **Passthrough as a fallback.** If a loader skips negotiation and calls the
+   manifest's named exports directly, `vkGetInstanceProcAddr` and
+   `vkGetDeviceProcAddr` now forward properly instead of returning NULL -
+   minimal `vkCreateInstance`/`vkCreateDevice` shims advance the chain link,
+   record the next layer's proc-addrs, and pass `pCreateInfo` down
+   unmodified. No dispatch tables, no swapchain hooks, no effects.
+3. **No side effects either.** The breadcrumb log and the `Logger`
+   constructor are both gated too, so the layer no longer creates files or
+   writes `OutputDebugString` inside other people's applications. The earlier
+   note about `vkbchoom.conf` being read in every process is also resolved:
+   the gate reads the one key it needs with raw `CreateFile`/`ReadFile` and
+   builds no `Config` object at all outside the target.
+
+The decision depends on nothing but `kernel32` and the executable name, so it
+is safe to answer from `DllMain` and from negotiation - earlier than any
+config, logger or CRT state can be relied on. Default target is
+`mgsvtpp.exe`; override with `targetExecutable` in `vkbchoom.conf`
+(case-insensitive), or `%VKBCHOOM_TARGET_EXE%` for a temporary override.
+
+**The registration itself is still global.** There is no way around that -
+it's the only mechanism Vulkan offers. The layer is inert everywhere else,
+but the registry value exists machine-wide until you remove it, and deleting
+the mod files does not remove it. `install_vkbchoom.exe -uninstall` does.
 
 ---
 
@@ -355,19 +477,65 @@ exactly how it turned up running inside chaiNNer's bundled `python.exe`.
 There's no registration-level fix for this; the Vulkan loader has no "only
 for this one executable" concept.
 
-The gate lives entirely in code: `isTargetProcess()` in `basalt.cpp`, checked
-once at the top of `INTERCEPT_CALLS`, wrapping every `GETPROCADDR` entry -
-including the self-referential `vkGetInstanceProcAddr` /
-`vkGetDeviceProcAddr` ones, not just the "real" functions further down. That
-last part matters: outside the target process, asking this layer for its own
-`GetInstanceProcAddr`/`GetDeviceProcAddr` hands back whatever's *next* in the
-chain instead, not a pointer to an inert version of our own function. A
-non-target process that resolves either of those once gets a direct line
-past us for everything after - our own hooks are never reached again for
-that instance/device, not just declined when reached. Don't special-case the
-self-referential entries back out of that `if` block; that would put the
-layer back in every process's chain, just quietly no-opping deeper down,
-which is a smaller version of the exact problem this exists to fix.
+The gate lives entirely in code, in three places, and all three matter:
+
+1. `layerShouldRunHere()` in `platform_win32.cpp` - the decision itself.
+   Executable name only, `kernel32` only, cached in a plain `int` with a
+   constant initialiser so there's no magic-static guard to take under the
+   loader lock. It has to be answerable from `DllMain` and from negotiation,
+   which is why it can't touch `Config`, `Logger`, iostreams or anything
+   that needs static init to have finished.
+2. `vkNegotiateLoaderLayerInterfaceVersion` in `basalt.cpp` - returns
+   `VK_ERROR_INITIALIZATION_FAILED` outside the target, and the loader drops
+   the layer from the chain entirely. This is the one that does the real
+   work; everything else is a safety net under it.
+3. The passthrough path in `vkbChoom_GetInstanceProcAddr` /
+   `vkbChoom_GetDeviceProcAddr`, for loaders that skip negotiation.
+
+### What the previous gate got wrong, and don't do it again
+
+The old note here claimed that outside the target process, asking the layer
+for its own `GetInstanceProcAddr`/`GetDeviceProcAddr` "hands back whatever's
+next in the chain instead". **It did not.** It handed back `nullptr`.
+
+Gating `INTERCEPT_CALLS` on `isTargetProcess()` also gated the handout of
+`vkCreateInstance`. `vkCreateInstance` is the only thing that populates
+`instanceDispatchMap`. So in a non-target process the map stayed empty
+forever, and the fallthrough at the bottom of both functions - which does
+`map.find(...)`, misses, and returns `nullptr` - was the answer to *every*
+query, for every function. The layer was still sitting in the chain,
+answering NULL to everything. Unrelated Vulkan applications crashed
+downstream on the first null function pointer they dereferenced: emulators
+stopped launching and `vulkaninfo` died with `0xC0000005`.
+
+The lesson generalises: **an implicit layer cannot opt out by declining to
+answer.** Once the loader has put you in the chain you are obliged to give
+correct answers, and "no answer" is not a correct answer. There are exactly
+two honest options - get removed from the chain (decline at negotiation), or
+forward faithfully (the `passthrough_*` functions). Anything that looks like
+"just don't hook anything and it'll be fine" is this bug again.
+
+Two corollaries:
+
+- The `passthrough_*` functions keep their own maps, separate from
+  `instanceDispatchMap`/`deviceMap`, so no effect, swapchain or screenshot
+  code can ever observe a non-target process. Don't merge them.
+- `passthrough_CreateInstance` passes `pCreateInfo` down **unmodified**. The
+  target path bumps `apiVersion` to 1.1 and can add extensions; doing either
+  inside somebody else's application is interference, even if it happens not
+  to break anything today.
+
+### Side effects count as interference too
+
+`breadcrumb()` and the `Logger` constructor both used to run unconditionally,
+at `DLL_PROCESS_ATTACH` and static init respectively - in every Vulkan
+process on the machine. That's how vkbchoom's own diagnostics ended up
+listing `citron.exe` and `pcsx2-qt.exe` as having loaded the layer. Both are
+gated now. If you add anything that writes a file, touches the registry or
+calls `OutputDebugString` from static init or `DllMain`, gate it.
+
+`VKBCHOOM_FORCE_LOG=1` turns the breadcrumb back on everywhere, for when the
+thing you're debugging *is* the gate.
 
 
 # License
